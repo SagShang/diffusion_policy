@@ -2,7 +2,7 @@ if __name__ == "__main__":
     import pathlib
     import sys
 
-    ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
+    ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
     sys.path.append(str(ROOT_DIR))
 
 import argparse
@@ -29,27 +29,27 @@ def episode_idx(path: pathlib.Path) -> int:
 def decode_rgb(blob) -> np.ndarray:
     payload = bytes(blob).rstrip(b"\x00")
     image = Image.open(io.BytesIO(payload)).convert("RGB")
-    return np.asarray(image, dtype=np.uint8)
+    return np.moveaxis(np.asarray(image, dtype=np.uint8), -1, 0)
 
 
-def load_episode(path: pathlib.Path, camera_key: str) -> dict:
+def load_episode(path: pathlib.Path, camera_keys: list[str]) -> dict:
     with h5py.File(path, "r") as root:
         qpos = root["joint_action/vector"][:].astype(np.float32)
-        images = root[f"observation/{camera_key}/rgb"]
-        head_camera = np.stack([decode_rgb(x) for x in images[:-1]], axis=0)
-
-    return {
-        "head_camera": head_camera,
-        "state": qpos[:-1],
-        "action": qpos[1:],
-    }
+        episode = {
+            "state": qpos[:-1],
+            "action": qpos[1:],
+        }
+        for camera_key in camera_keys:
+            images = root[f"observation/{camera_key}/rgb"]
+            episode[camera_key] = np.stack([decode_rgb(x) for x in images[:-1]], axis=0)
+    return episode
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="/home/wentao/RoboTwin/data/lift_pot")
     parser.add_argument("--output", default="data/datasets/lift_pot")
-    parser.add_argument("--camera", default="head_camera")
+    parser.add_argument("--camera", nargs="+", default=["head_camera"])
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
