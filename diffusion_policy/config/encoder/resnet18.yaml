@@ -1,0 +1,12 @@
+rgb_model:
+  _target_: diffusion_policy.model.vision.model_getter.get_resnet
+  name: resnet18
+  weights: null
+
+resize_shape: null
+crop_shape: null
+random_crop: true
+use_group_norm: true
+share_rgb_model: false
+imagenet_norm: true
+image_normalizer: range

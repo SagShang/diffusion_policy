@@ -1,6 +1,9 @@
 import torch
 import torchvision
 
+from diffusion_policy.model.vision.dinov3_encoder import DINOv3Encoder
+
+
 def get_resnet(name, weights=None, **kwargs):
     """
     name: resnet18, resnet34, resnet50
@@ -26,3 +29,7 @@ def get_r3m(name, **kwargs):
     resnet_model = r3m_model.convnet
     resnet_model = resnet_model.to('cpu')
     return resnet_model
+
+
+def get_dinov3(name="dinov3_vits16", **kwargs):
+    return DINOv3Encoder(name=name, **kwargs)

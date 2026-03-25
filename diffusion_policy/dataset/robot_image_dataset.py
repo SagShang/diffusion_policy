@@ -12,7 +12,10 @@ from diffusion_policy.common.sampler import (
 )
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
-from diffusion_policy.common.normalize_util import get_image_range_normalizer
+from diffusion_policy.common.normalize_util import (
+    get_identity_image_normalizer,
+    get_image_range_normalizer,
+)
 import pdb
 
 
@@ -28,6 +31,7 @@ class RobotImageDataset(BaseImageDataset):
         val_ratio=0.0,
         batch_size=128,
         max_train_episodes=None,
+        image_normalizer="range",
     ):
 
         super().__init__()
@@ -52,6 +56,7 @@ class RobotImageDataset(BaseImageDataset):
         self.horizon = horizon
         self.pad_before = pad_before
         self.pad_after = pad_after
+        self.image_normalizer = image_normalizer
 
         self.batch_size = batch_size
         sequence_length = self.sampler.sequence_length
@@ -82,10 +87,16 @@ class RobotImageDataset(BaseImageDataset):
         }
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
-        normalizer["head_cam"] = get_image_range_normalizer()
-        normalizer["front_cam"] = get_image_range_normalizer()
-        normalizer["left_cam"] = get_image_range_normalizer()
-        normalizer["right_cam"] = get_image_range_normalizer()
+        if self.image_normalizer == "range":
+            image_normalizer = get_image_range_normalizer()
+        elif self.image_normalizer == "identity":
+            image_normalizer = get_identity_image_normalizer()
+        else:
+            raise ValueError(f"Unsupported image_normalizer: {self.image_normalizer}")
+        normalizer["head_cam"] = image_normalizer
+        normalizer["front_cam"] = image_normalizer
+        normalizer["left_cam"] = image_normalizer
+        normalizer["right_cam"] = image_normalizer
         return normalizer
 
     def __len__(self) -> int:
