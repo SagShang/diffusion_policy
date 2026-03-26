@@ -1,10 +1,17 @@
 import importlib
 import sys
 from pathlib import Path
+from typing import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from diffusion_policy.model.vision.lora import (
+    LoRALinear,
+    inject_lora_into_last_blocks,
+    normalize_module_paths,
+)
 
 
 _DINOV3_DEFAULT_WEIGHTS = {
@@ -143,6 +150,12 @@ class DINOv3Encoder(nn.Module):
         resize_long_edge=320,
         fuse_layers=4,
         pooling="spatial_softmax",
+        lora_rank=0,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        lora_blocks=0,
+        lora_targets: Sequence[str] | str = ("attn.qkv", "attn.proj"),
+        lora_lr_scale=1.0,
     ):
         super().__init__()
 
@@ -158,6 +171,14 @@ class DINOv3Encoder(nn.Module):
         self.backbone.requires_grad_(False)
         self.backbone.eval()
 
+        self.lora_rank = int(lora_rank)
+        self.lora_alpha = float(lora_alpha)
+        self.lora_dropout = float(lora_dropout)
+        self.lora_blocks = int(lora_blocks)
+        self.lora_targets = normalize_module_paths(lora_targets)
+        self.lora_lr_scale = float(lora_lr_scale)
+        self.lora_module_names: list[str] = []
+
         patch_size = int(getattr(self.backbone, "patch_size", 16))
         embed_dim = int(getattr(self.backbone, "embed_dim"))
         total_blocks = len(self.backbone.blocks)
@@ -168,6 +189,16 @@ class DINOv3Encoder(nn.Module):
             patch_size=patch_size,
         )
         self.layer_indices = list(range(total_blocks - num_fused_layers, total_blocks))
+        self.lora_block_indices, self.lora_module_names = inject_lora_into_last_blocks(
+            self.backbone.blocks,
+            lora_blocks=self.lora_blocks,
+            lora_targets=self.lora_targets,
+            lora_rank=self.lora_rank,
+            lora_alpha=self.lora_alpha,
+            lora_dropout=self.lora_dropout,
+            module_prefix="backbone.blocks",
+        )
+        self.backbone_requires_grad = any(param.requires_grad for param in self.backbone.parameters())
 
         if num_fused_layers > 1:
             self.layer_weights = nn.Parameter(torch.zeros(num_fused_layers))
@@ -195,6 +226,33 @@ class DINOv3Encoder(nn.Module):
             nn.Linear(pooled_dim, output_dim),
         )
 
+    def get_optimizer_param_groups(self, base_lr: float):
+        base_lr = float(base_lr)
+        grouped_params = {"base": [], "lora": []}
+
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            is_lora_param = name.startswith("backbone.") and (
+                ".lora_A." in name or ".lora_B." in name
+            )
+            grouped_params["lora" if is_lora_param else "base"].append(param)
+
+        lr_by_group = {
+            "base": base_lr,
+            "lora": base_lr * self.lora_lr_scale,
+        }
+        return [
+            {
+                "params": params,
+                "lr": lr_by_group[group_name],
+                "name": group_name,
+            }
+            for group_name, params in grouped_params.items()
+            if params
+        ]
+
     def _fuse_feature_maps(self, feature_maps):
         if len(feature_maps) == 1:
             return feature_maps[0]
@@ -208,13 +266,21 @@ class DINOv3Encoder(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         images = self.preprocess(images)
 
-        with torch.no_grad():
+        if self.backbone_requires_grad and torch.is_grad_enabled():
             feature_maps = self.backbone.get_intermediate_layers(
                 images,
                 n=self.layer_indices,
                 reshape=True,
                 norm=True,
             )
+        else:
+            with torch.no_grad():
+                feature_maps = self.backbone.get_intermediate_layers(
+                    images,
+                    n=self.layer_indices,
+                    reshape=True,
+                    norm=True,
+                )
 
         feature_map = self._fuse_feature_maps(feature_maps)
         feature_map = self.adapter(feature_map)

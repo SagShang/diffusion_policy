@@ -193,3 +193,46 @@ class MultiImageObsEncoder(ModuleAttrMixin):
         example_output = self.forward(example_obs_dict)
         output_shape = example_output.shape[1:]
         return output_shape
+
+    def get_optimizer_param_groups(self, base_lr: float):
+        base_lr = float(base_lr)
+        param_groups = list()
+        seen_param_ids = set()
+
+        def take_unique_trainable(params):
+            unique_params = []
+            for param in params:
+                param_id = id(param)
+                if not param.requires_grad or param.numel() == 0 or param_id in seen_param_ids:
+                    continue
+                unique_params.append(param)
+                seen_param_ids.add(param_id)
+            return unique_params
+
+        for key, model in self.key_model_map.items():
+            model_groups = (
+                model.get_optimizer_param_groups(base_lr=base_lr)
+                if hasattr(model, "get_optimizer_param_groups")
+                else ({"params": model.parameters(), "lr": base_lr, "name": "base"},)
+            )
+
+            for group in model_groups:
+                params = take_unique_trainable(group["params"])
+                if not params:
+                    continue
+                group_name = group.get("name", "base")
+                param_groups.append({
+                    **group,
+                    "params": params,
+                    "name": f"obs_encoder.{key}.{group_name}",
+                })
+
+        remaining_params = take_unique_trainable(self.parameters())
+        if remaining_params:
+            param_groups.append({
+                "params": remaining_params,
+                "lr": base_lr,
+                "name": "obs_encoder.base",
+            })
+
+        return param_groups

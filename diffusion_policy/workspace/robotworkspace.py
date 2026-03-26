@@ -49,11 +49,49 @@ class RobotWorkspace(BaseWorkspace):
             self.ema_model = copy.deepcopy(self.model)
 
         # configure training state
-        self.optimizer = hydra.utils.instantiate(cfg.optimizer, params=self.model.parameters())
+        self.optimizer = self._create_optimizer()
 
         # configure training state
         self.global_step = 0
         self.epoch = 0
+
+    def _get_model_param_groups(self):
+        base_lr = float(self.cfg.optimizer.lr)
+        obs_encoder = self.model.obs_encoder
+        if not hasattr(obs_encoder, "get_optimizer_param_groups"):
+            return self.model.parameters()
+
+        encoder_groups = obs_encoder.get_optimizer_param_groups(base_lr=base_lr)
+        if len(encoder_groups) == 0:
+            return self.model.parameters()
+
+        grouped_param_ids = {
+            id(param)
+            for group in encoder_groups
+            for param in group["params"]
+        }
+        other_params = [
+            param for param in self.model.parameters()
+            if param.requires_grad and param.numel() > 0 and id(param) not in grouped_param_ids
+        ]
+
+        if other_params:
+            encoder_groups.insert(0, {
+                "params": other_params,
+                "lr": base_lr,
+                "name": "model.base",
+            })
+
+        return encoder_groups
+
+    def _create_optimizer(self):
+        params = self._get_model_param_groups()
+        optimizer_cfg = OmegaConf.to_container(self.cfg.optimizer, resolve=True)
+        optimizer_target = optimizer_cfg.pop("_target_")
+        optimizer_cls = hydra.utils.get_class(optimizer_target)
+        optimizer_cfg.pop("_recursive_", None)
+        optimizer_cfg.pop("_convert_", None)
+        return optimizer_cls(params=params, **optimizer_cfg)
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)

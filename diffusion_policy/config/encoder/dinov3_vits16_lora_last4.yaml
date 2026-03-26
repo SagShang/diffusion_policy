@@ -8,10 +8,10 @@ rgb_model:
   resize_long_edge: 320
   fuse_layers: 4
   pooling: spatial_softmax
-  lora_rank: 0
+  lora_rank: 8
   lora_alpha: 16
   lora_dropout: 0.05
-  lora_blocks: 0
+  lora_blocks: 4
   lora_targets: [attn.qkv, attn.proj]
   lora_lr_scale: 1.0
 
