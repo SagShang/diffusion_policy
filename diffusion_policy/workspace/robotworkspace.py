@@ -260,9 +260,21 @@ class RobotWorkspace(BaseWorkspace):
 
                 # checkpoint
                 if ((self.epoch + 1) % cfg.training.checkpoint_every) == 0:
-                    # checkpointing
-                    save_name = pathlib.Path(self.cfg.task.dataset.zarr_path).stem
-                    self.save_checkpoint(f"checkpoints/{save_name}-{seed}/{self.epoch + 1}.ckpt")  # TODO
+                    if cfg.checkpoint.save_last_ckpt:
+                        self.save_checkpoint()
+                    if cfg.checkpoint.save_last_snapshot:
+                        self.save_snapshot()
+
+                    metric_dict = dict()
+                    for key, value in step_log.items():
+                        new_key = key.replace("/", "_")
+                        metric_dict[new_key] = value
+
+                    monitor_key = cfg.checkpoint.topk.monitor_key
+                    if monitor_key in metric_dict:
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
 
                 # ========= eval end for this epoch ==========
                 policy.train()
