@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - task: default_task_16
+  - task: default_task_14
   - encoder: dinov3_vits16
 
 name: robot_${task.name}
