@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from diffusion_policy.model.vision.lora import (
-    LoRALinear,
     inject_lora_into_last_blocks,
     normalize_module_paths,
 )
@@ -59,6 +58,34 @@ def _resolve_weights_path(name: str, weights):
     if not weights_path.exists():
         raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
     return weights_path
+
+
+def _strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if not state_dict:
+        return state_dict
+    if not all(key.startswith("module.") for key in state_dict.keys()):
+        return state_dict
+    return {key[len("module."):]: value for key, value in state_dict.items()}
+
+
+def _load_state_dict(weights) -> dict[str, torch.Tensor]:
+    weights_str = str(weights)
+    if weights_str.startswith(("http://", "https://", "file://")):
+        state_dict = torch.hub.load_state_dict_from_url(weights_str, map_location="cpu")
+    else:
+        state_dict = torch.load(weights_str, map_location="cpu", weights_only=True)
+
+    if isinstance(state_dict, dict):
+        for key in ("state_dict", "model", "teacher"):
+            value = state_dict.get(key)
+            if isinstance(value, dict):
+                state_dict = value
+                break
+
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Unsupported DINOv3 checkpoint format: {type(state_dict)}")
+
+    return _strip_module_prefix(state_dict)
 
 
 def _get_num_groups(num_channels: int) -> int:
@@ -162,11 +189,16 @@ class DINOv3Encoder(nn.Module):
         dinov3_backbones = _import_dinov3_backbones()
         builder = getattr(dinov3_backbones, name)
 
-        resolved_weights = _resolve_weights_path(name=name, weights=weights)
-        if resolved_weights is None:
-            self.backbone = builder(pretrained=pretrained)
+        if pretrained:
+            resolved_weights = _resolve_weights_path(name=name, weights=weights)
+            if resolved_weights is None:
+                self.backbone = builder(pretrained=True)
+            else:
+                self.backbone = builder(pretrained=False)
+                state_dict = _load_state_dict(resolved_weights)
+                self.backbone.load_state_dict(state_dict, strict=True)
         else:
-            self.backbone = builder(pretrained=True, weights=str(resolved_weights))
+            self.backbone = builder(pretrained=False)
 
         self.backbone.requires_grad_(False)
         self.backbone.eval()
@@ -225,6 +257,12 @@ class DINOv3Encoder(nn.Module):
             nn.LayerNorm(pooled_dim),
             nn.Linear(pooled_dim, output_dim),
         )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if not self.backbone_requires_grad:
+            self.backbone.eval()
+        return self
 
     def get_optimizer_param_groups(self, base_lr: float):
         base_lr = float(base_lr)
