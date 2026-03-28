@@ -5,27 +5,12 @@ import torch
 import torch.nn as nn
 
 
-def normalize_module_paths(module_paths) -> tuple[str, ...]:
+def normalize_module_paths(module_paths: Sequence[str] | str | None) -> tuple[str, ...]:
     if module_paths is None:
         return ()
     if isinstance(module_paths, str):
         return tuple(path.strip() for path in module_paths.split(",") if path.strip())
     return tuple(str(path) for path in module_paths)
-
-
-def get_submodule(root_module: nn.Module, module_path: str) -> nn.Module:
-    module = root_module
-    for part in module_path.split("."):
-        module = getattr(module, part)
-    return module
-
-
-def set_submodule(root_module: nn.Module, module_path: str, new_module: nn.Module) -> None:
-    parts = module_path.split(".")
-    parent = root_module
-    for part in parts[:-1]:
-        parent = getattr(parent, part)
-    setattr(parent, parts[-1], new_module)
 
 
 class LoRALinear(nn.Module):
@@ -87,42 +72,48 @@ class LoRALinear(nn.Module):
         )
 
 
-def inject_lora_into_last_blocks(
-    blocks: Sequence[nn.Module],
+def inject_lora(
+    backbone: nn.Module,
     *,
     lora_blocks: int,
     lora_targets,
     lora_rank: int,
     lora_alpha: float,
     lora_dropout: float,
-    module_prefix: str = "blocks",
-) -> tuple[list[int], list[str]]:
+) -> nn.Module:
+    lora_rank = int(lora_rank)
+    lora_alpha = float(lora_alpha)
+    lora_dropout = float(lora_dropout)
+    lora_blocks = int(lora_blocks)
     target_paths = normalize_module_paths(lora_targets)
     if lora_rank <= 0 or lora_blocks <= 0 or len(target_paths) == 0:
-        return [], []
+        return backbone
 
+    blocks = backbone.blocks
     total_blocks = len(blocks)
-    num_lora_blocks = min(int(lora_blocks), total_blocks)
-    block_indices = list(range(total_blocks - num_lora_blocks, total_blocks))
-    lora_module_names = []
+    num_lora_blocks = min(lora_blocks, total_blocks)
 
-    for block_idx in block_indices:
-        block = blocks[block_idx]
+    for block in blocks[total_blocks - num_lora_blocks:]:
         for target_path in target_paths:
-            module = get_submodule(block, target_path)
-            if isinstance(module, LoRALinear):
+            target_module = block.get_submodule(target_path)
+            if isinstance(target_module, LoRALinear):
                 continue
-            if not isinstance(module, nn.Linear):
+            if not isinstance(target_module, nn.Linear):
                 raise TypeError(
-                    f"LoRA target '{target_path}' in block {block_idx} must be nn.Linear, got {type(module)}"
+                    f"LoRA target '{target_path}' must be nn.Linear, got {type(target_module)}"
                 )
-            lora_module = LoRALinear(
-                base_layer=module,
-                rank=lora_rank,
-                alpha=lora_alpha,
-                dropout=lora_dropout,
-            )
-            set_submodule(block, target_path, lora_module)
-            lora_module_names.append(f"{module_prefix}.{block_idx}.{target_path}")
 
-    return block_indices, lora_module_names
+            parent_path, _, child_name = target_path.rpartition(".")
+            parent_module = block.get_submodule(parent_path) if parent_path else block
+            setattr(
+                parent_module,
+                child_name,
+                LoRALinear(
+                    base_layer=target_module,
+                    rank=lora_rank,
+                    alpha=lora_alpha,
+                    dropout=lora_dropout,
+                ),
+            )
+
+    return backbone

@@ -1,4 +1,5 @@
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -7,85 +8,41 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from diffusion_policy.model.vision.lora import (
-    inject_lora_into_last_blocks,
-    normalize_module_paths,
-)
-
-
-_DINOV3_DEFAULT_WEIGHTS = {
-    "dinov3_vits16": "data/pretrained/dinov3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
-    "dinov3_vitb16": "data/pretrained/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
-}
-
+from diffusion_policy.model.vision.lora import inject_lora
 
 def _get_repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _get_dinov3_repo_path() -> Path:
-    return _get_repo_root() / "third_party" / "dinov3"
-
-
-def _import_dinov3_backbones():
-    module_name = "dinov3.hub.backbones"
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError:
-        repo_path = _get_dinov3_repo_path()
-        repo_path_str = str(repo_path)
-        if repo_path.exists() and repo_path_str not in sys.path:
-            sys.path.insert(0, repo_path_str)
-        return importlib.import_module(module_name)
-
-
-def _resolve_weights_path(name: str, weights):
+def _build_dinov3_backbone(weights, pretrained: bool = True) -> nn.Module:
     if weights is None:
-        default_relpath = _DINOV3_DEFAULT_WEIGHTS.get(name)
-        if default_relpath is None:
-            return None
-        default_path = _get_repo_root() / default_relpath
-        return default_path if default_path.exists() else None
+        raise ValueError("DINOv3 weights path is required")
 
-    weights_str = str(weights)
-    if weights_str.startswith(("http://", "https://", "file://")):
-        return weights_str
+    repo_path = _get_repo_root() / "third_party" / "dinov3"
+    repo_path_str = str(repo_path)
+    if importlib.util.find_spec("dinov3") is None and repo_path.exists() and repo_path_str not in sys.path:
+        sys.path.insert(0, repo_path_str)
+    dinov3_backbones = importlib.import_module("dinov3.hub.backbones")
 
-    weights_path = Path(weights).expanduser()
-    if not weights_path.is_absolute():
-        weights_path = _get_repo_root() / weights_path
-    weights_path = weights_path.resolve()
-    if not weights_path.exists():
-        raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
-    return weights_path
+    builder = dinov3_backbones.dinov3_vits16
+    backbone = builder(pretrained=False)
+    if not pretrained:
+        return backbone
 
-
-def _strip_module_prefix(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    if not state_dict:
-        return state_dict
-    if not all(key.startswith("module.") for key in state_dict.keys()):
-        return state_dict
-    return {key[len("module."):]: value for key, value in state_dict.items()}
-
-
-def _load_state_dict(weights) -> dict[str, torch.Tensor]:
     weights_str = str(weights)
     if weights_str.startswith(("http://", "https://", "file://")):
         state_dict = torch.hub.load_state_dict_from_url(weights_str, map_location="cpu")
     else:
-        state_dict = torch.load(weights_str, map_location="cpu", weights_only=True)
+        weights_path = Path(weights).expanduser()
+        if not weights_path.is_absolute():
+            weights_path = _get_repo_root() / weights_path
+        weights_path = weights_path.resolve()
+        if not weights_path.exists():
+            raise FileNotFoundError(f"DINOv3 weights not found: {weights_path}")
+        state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
 
-    if isinstance(state_dict, dict):
-        for key in ("state_dict", "model", "teacher"):
-            value = state_dict.get(key)
-            if isinstance(value, dict):
-                state_dict = value
-                break
-
-    if not isinstance(state_dict, dict):
-        raise ValueError(f"Unsupported DINOv3 checkpoint format: {type(state_dict)}")
-
-    return _strip_module_prefix(state_dict)
+    backbone.load_state_dict(state_dict, strict=True)
+    return backbone
 
 
 def _get_num_groups(num_channels: int) -> int:
@@ -150,32 +107,84 @@ class DINOv3ImagePreprocessor(nn.Module):
         return images
 
 
-class SpatialSoftmaxPool2d(nn.Module):
+class AttentionPool2d(nn.Module):
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn = nn.Linear(dim, 1)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.attn(tokens), dim=1)
+        return torch.sum(tokens * weights, dim=1)
+
+
+class SpatialSoftmax2d(nn.Module):
+
     def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
         batch_size, channels, height, width = feature_map.shape
-        weights = F.softmax(feature_map.flatten(2), dim=-1)
-
+        weights = F.softmax(feature_map.flatten(2), dim=-1).reshape(batch_size, channels, height, width)
         pos_y = torch.linspace(-1.0, 1.0, height, device=feature_map.device, dtype=feature_map.dtype)
         pos_x = torch.linspace(-1.0, 1.0, width, device=feature_map.device, dtype=feature_map.dtype)
         grid_y, grid_x = torch.meshgrid(pos_y, pos_x, indexing="ij")
-        grid_x = grid_x.reshape(1, 1, -1)
-        grid_y = grid_y.reshape(1, 1, -1)
-
-        expected_x = torch.sum(weights * grid_x, dim=-1)
-        expected_y = torch.sum(weights * grid_y, dim=-1)
+        expected_x = torch.sum(weights * grid_x.view(1, 1, height, width), dim=(2, 3))
+        expected_y = torch.sum(weights * grid_y.view(1, 1, height, width), dim=(2, 3))
         return torch.cat([expected_x, expected_y], dim=-1)
+
+
+class DINOv3CameraAdapter(nn.Module):
+
+    def __init__(self, input_dim: int, adapter_dim: int, output_dim: int, pooling: str = "spatial_softmax"):
+        super().__init__()
+        num_groups = _get_num_groups(adapter_dim)
+        self.proj = nn.Sequential(
+            nn.Conv2d(input_dim, adapter_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim),
+            nn.GELU(),
+            nn.Conv2d(adapter_dim, adapter_dim, kernel_size=3, padding=1, groups=adapter_dim, bias=False),
+            nn.Conv2d(adapter_dim, adapter_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim),
+            nn.GELU(),
+        )
+
+        if pooling == "attention":
+            self.pool = AttentionPool2d(adapter_dim)
+            pooled_dim = adapter_dim
+        elif pooling == "avg":
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            pooled_dim = adapter_dim
+        elif pooling == "spatial_softmax":
+            self.pool = SpatialSoftmax2d()
+            pooled_dim = adapter_dim * 2
+        else:
+            raise ValueError(f"Unsupported pooling mode: {pooling}")
+
+        self.out = nn.Sequential(
+            nn.LayerNorm(pooled_dim),
+            nn.Linear(pooled_dim, output_dim),
+        )
+        self.pooling = pooling
+
+    def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
+        reduced = self.proj(feature_map)
+        if self.pooling == "attention":
+            pooled = self.pool(reduced.flatten(2).transpose(1, 2))
+        elif self.pooling == "avg":
+            pooled = self.pool(reduced).flatten(start_dim=1)
+        else:
+            pooled = self.pool(reduced)
+        return self.out(pooled)
 
 
 class DINOv3Encoder(nn.Module):
     def __init__(
         self,
-        name="dinov3_vits16",
         weights=None,
         pretrained=True,
+        freeze_backbone=True,
         output_dim=512,
         adapter_dim=256,
         resize_long_edge=320,
-        fuse_layers=4,
+        fuse_layers=1,
         pooling="spatial_softmax",
         lora_rank=0,
         lora_alpha=16.0,
@@ -186,30 +195,16 @@ class DINOv3Encoder(nn.Module):
     ):
         super().__init__()
 
-        dinov3_backbones = _import_dinov3_backbones()
-        builder = getattr(dinov3_backbones, name)
+        self.backbone = _build_dinov3_backbone(
+            weights=weights,
+            pretrained=pretrained,
+        )
 
-        if pretrained:
-            resolved_weights = _resolve_weights_path(name=name, weights=weights)
-            if resolved_weights is None:
-                self.backbone = builder(pretrained=True)
-            else:
-                self.backbone = builder(pretrained=False)
-                state_dict = _load_state_dict(resolved_weights)
-                self.backbone.load_state_dict(state_dict, strict=True)
-        else:
-            self.backbone = builder(pretrained=False)
+        self.backbone.requires_grad_(not freeze_backbone)
+        if freeze_backbone:
+            self.backbone.eval()
 
-        self.backbone.requires_grad_(False)
-        self.backbone.eval()
-
-        self.lora_rank = int(lora_rank)
-        self.lora_alpha = float(lora_alpha)
-        self.lora_dropout = float(lora_dropout)
-        self.lora_blocks = int(lora_blocks)
-        self.lora_targets = normalize_module_paths(lora_targets)
         self.lora_lr_scale = float(lora_lr_scale)
-        self.lora_module_names: list[str] = []
 
         patch_size = int(getattr(self.backbone, "patch_size", 16))
         embed_dim = int(getattr(self.backbone, "embed_dim"))
@@ -221,14 +216,13 @@ class DINOv3Encoder(nn.Module):
             patch_size=patch_size,
         )
         self.layer_indices = list(range(total_blocks - num_fused_layers, total_blocks))
-        self.lora_block_indices, self.lora_module_names = inject_lora_into_last_blocks(
-            self.backbone.blocks,
-            lora_blocks=self.lora_blocks,
-            lora_targets=self.lora_targets,
-            lora_rank=self.lora_rank,
-            lora_alpha=self.lora_alpha,
-            lora_dropout=self.lora_dropout,
-            module_prefix="backbone.blocks",
+        self.backbone = inject_lora(
+            self.backbone,
+            lora_blocks=lora_blocks,
+            lora_targets=lora_targets,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
         )
         self.backbone_requires_grad = any(param.requires_grad for param in self.backbone.parameters())
 
@@ -237,25 +231,11 @@ class DINOv3Encoder(nn.Module):
         else:
             self.register_parameter("layer_weights", None)
 
-        self.adapter = nn.Sequential(
-            nn.Conv2d(embed_dim, adapter_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups=_get_num_groups(adapter_dim), num_channels=adapter_dim),
-            nn.GELU(),
-        )
-
-        if pooling == "avg":
-            self.pool = nn.AdaptiveAvgPool2d((1, 1))
-            pooled_dim = adapter_dim
-        elif pooling == "spatial_softmax":
-            self.pool = SpatialSoftmaxPool2d()
-            pooled_dim = adapter_dim * 2
-        else:
-            raise ValueError(f"Unsupported DINOv3 pooling: {pooling}")
-
-        self.pooling = pooling
-        self.head = nn.Sequential(
-            nn.LayerNorm(pooled_dim),
-            nn.Linear(pooled_dim, output_dim),
+        self.adapter = DINOv3CameraAdapter(
+            input_dim=embed_dim,
+            adapter_dim=adapter_dim,
+            output_dim=output_dim,
+            pooling=pooling,
         )
 
     def train(self, mode: bool = True):
@@ -272,9 +252,7 @@ class DINOv3Encoder(nn.Module):
             if not param.requires_grad:
                 continue
 
-            is_lora_param = name.startswith("backbone.") and (
-                ".lora_A." in name or ".lora_B." in name
-            )
+            is_lora_param = name.startswith("backbone.") and ".lora_" in name
             grouped_params["lora" if is_lora_param else "base"].append(param)
 
         lr_by_group = {
@@ -296,10 +274,8 @@ class DINOv3Encoder(nn.Module):
             return feature_maps[0]
 
         weights = torch.softmax(self.layer_weights, dim=0)
-        fused = 0
-        for weight, feature_map in zip(weights, feature_maps):
-            fused = fused + weight * feature_map
-        return fused
+        stacked = torch.stack(feature_maps, dim=1)
+        return torch.sum(stacked * weights.view(1, -1, 1, 1, 1), dim=1)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         images = self.preprocess(images)
@@ -321,11 +297,4 @@ class DINOv3Encoder(nn.Module):
                 )
 
         feature_map = self._fuse_feature_maps(feature_maps)
-        feature_map = self.adapter(feature_map)
-
-        if self.pooling == "avg":
-            pooled = self.pool(feature_map).flatten(start_dim=1)
-        else:
-            pooled = self.pool(feature_map)
-
-        return self.head(pooled)
+        return self.adapter(feature_map)

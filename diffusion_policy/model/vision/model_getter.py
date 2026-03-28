@@ -31,5 +31,5 @@ def get_r3m(name, **kwargs):
     return resnet_model
 
 
-def get_dinov3(name="dinov3_vits16", **kwargs):
-    return DINOv3Encoder(name=name, **kwargs)
+def get_dinov3(**kwargs):
+    return DINOv3Encoder(**kwargs)
