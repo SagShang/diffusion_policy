@@ -122,7 +122,8 @@ class SpatialSoftmax2d(nn.Module):
 
     def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
         batch_size, channels, height, width = feature_map.shape
-        weights = F.softmax(feature_map.flatten(2), dim=-1).reshape(batch_size, channels, height, width)
+        logits = feature_map.flatten(2).to(dtype=torch.float32)
+        weights = F.softmax(logits, dim=-1).to(dtype=feature_map.dtype).reshape(batch_size, channels, height, width)
         pos_y = torch.linspace(-1.0, 1.0, height, device=feature_map.device, dtype=feature_map.dtype)
         pos_x = torch.linspace(-1.0, 1.0, width, device=feature_map.device, dtype=feature_map.dtype)
         grid_y, grid_x = torch.meshgrid(pos_y, pos_x, indexing="ij")
@@ -136,15 +137,23 @@ class DINOv3CameraAdapter(nn.Module):
     def __init__(self, input_dim: int, adapter_dim: int, output_dim: int, pooling: str = "spatial_softmax"):
         super().__init__()
         num_groups = _get_num_groups(adapter_dim)
-        self.proj = nn.Sequential(
-            nn.Conv2d(input_dim, adapter_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim),
-            nn.GELU(),
-            nn.Conv2d(adapter_dim, adapter_dim, kernel_size=3, padding=1, groups=adapter_dim, bias=False),
-            nn.Conv2d(adapter_dim, adapter_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim),
-            nn.GELU(),
+        self.skip = (
+            nn.Conv2d(input_dim, adapter_dim, kernel_size=1, bias=False)
+            if input_dim != adapter_dim else nn.Identity()
         )
+        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim)
+        self.dwconv = nn.Conv2d(
+            adapter_dim,
+            adapter_dim,
+            kernel_size=3,
+            padding=1,
+            groups=adapter_dim,
+            bias=False,
+        )
+        self.act = nn.GELU()
+        self.out_proj = nn.Conv2d(adapter_dim, adapter_dim, kernel_size=1, bias=False)
+        # Start from exact identity while keeping the residual branch trainable.
+        self.gate = nn.Parameter(torch.zeros(1))
 
         if pooling == "attention":
             self.pool = AttentionPool2d(adapter_dim)
@@ -165,7 +174,12 @@ class DINOv3CameraAdapter(nn.Module):
         self.pooling = pooling
 
     def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
-        reduced = self.proj(feature_map)
+        residual = self.skip(feature_map)
+        reduced = self.norm(residual)
+        reduced = self.dwconv(reduced)
+        reduced = self.act(reduced)
+        reduced = self.out_proj(reduced)
+        reduced = residual + self.gate * reduced
         if self.pooling == "attention":
             pooled = self.pool(reduced.flatten(2).transpose(1, 2))
         elif self.pooling == "avg":
