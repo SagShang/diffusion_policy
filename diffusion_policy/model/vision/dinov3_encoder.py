@@ -199,6 +199,7 @@ class DINOv3Encoder(nn.Module):
         adapter_dim=256,
         resize_long_edge=320,
         fuse_layers=1,
+        fuse_cls=False,
         pooling="spatial_softmax",
         lora_rank=0,
         lora_alpha=16.0,
@@ -224,6 +225,7 @@ class DINOv3Encoder(nn.Module):
         embed_dim = int(getattr(self.backbone, "embed_dim"))
         total_blocks = len(self.backbone.blocks)
         num_fused_layers = max(1, min(fuse_layers, total_blocks))
+        self.fuse_cls = bool(fuse_cls)
 
         self.preprocess = DINOv3ImagePreprocessor(
             resize_long_edge=resize_long_edge,
@@ -242,8 +244,19 @@ class DINOv3Encoder(nn.Module):
 
         if num_fused_layers > 1:
             self.layer_weights = nn.Parameter(torch.zeros(num_fused_layers))
+            if self.fuse_cls:
+                self.cls_layer_weights = nn.Parameter(torch.zeros(num_fused_layers))
+            else:
+                self.register_parameter("cls_layer_weights", None)
         else:
             self.register_parameter("layer_weights", None)
+            self.register_parameter("cls_layer_weights", None)
+
+        if self.fuse_cls:
+            # Start from patch-only features; let training decide how much global cls context to add.
+            self.cls_weight = nn.Parameter(torch.zeros(1))
+        else:
+            self.register_parameter("cls_weight", None)
 
         self.adapter = DINOv3CameraAdapter(
             input_dim=embed_dim,
@@ -291,24 +304,45 @@ class DINOv3Encoder(nn.Module):
         stacked = torch.stack(feature_maps, dim=1)
         return torch.sum(stacked * weights.view(1, -1, 1, 1, 1), dim=1)
 
+    def _fuse_class_tokens(self, class_tokens):
+        if len(class_tokens) == 1:
+            return class_tokens[0]
+
+        weights = torch.softmax(self.cls_layer_weights, dim=0)
+        stacked = torch.stack(class_tokens, dim=1)
+        return torch.sum(stacked * weights.view(1, -1, 1), dim=1)
+
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         images = self.preprocess(images)
 
         if self.backbone_requires_grad and torch.is_grad_enabled():
-            feature_maps = self.backbone.get_intermediate_layers(
+            backbone_outputs = self.backbone.get_intermediate_layers(
                 images,
                 n=self.layer_indices,
                 reshape=True,
+                return_class_token=self.fuse_cls,
                 norm=True,
             )
         else:
             with torch.no_grad():
-                feature_maps = self.backbone.get_intermediate_layers(
+                backbone_outputs = self.backbone.get_intermediate_layers(
                     images,
                     n=self.layer_indices,
                     reshape=True,
+                    return_class_token=self.fuse_cls,
                     norm=True,
                 )
 
+        if self.fuse_cls:
+            feature_maps = [feature_map for feature_map, _ in backbone_outputs]
+            class_tokens = [class_token for _, class_token in backbone_outputs]
+        else:
+            feature_maps = backbone_outputs
+
         feature_map = self._fuse_feature_maps(feature_maps)
+        if self.fuse_cls:
+            class_token = self._fuse_class_tokens(class_tokens)
+            feature_map = feature_map + self.cls_weight.to(dtype=feature_map.dtype) * class_token[
+                :, :, None, None
+            ].to(dtype=feature_map.dtype)
         return self.adapter(feature_map)
