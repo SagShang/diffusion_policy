@@ -146,3 +146,5 @@ dmypy.json
 /checkpoints/
 /pretrained/
 /*.sh
+
+.codex
