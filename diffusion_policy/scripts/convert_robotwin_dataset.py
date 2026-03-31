@@ -26,17 +26,14 @@ def episode_idx(path: pathlib.Path) -> int:
     return int(match.group(1))
 
 
-def decode_image(blob, color_order: str = "rgb") -> np.ndarray:
+def decode_image(blob) -> np.ndarray:
     payload = bytes(blob).rstrip(b"\x00")
     image = Image.open(io.BytesIO(payload)).convert("RGB")
     array = np.asarray(image, dtype=np.uint8)
-    if color_order == "bgr":
-        # Some source datasets appear to have red/blue channels swapped.
-        array = array[..., ::-1]
     return np.moveaxis(array, -1, 0)
 
 
-def load_episode(path: pathlib.Path, camera_keys: list[str], decode_color_order: str) -> dict:
+def load_episode(path: pathlib.Path, camera_keys: list[str]) -> dict:
     with h5py.File(path, "r") as root:
         qpos = root["joint_action/vector"][:].astype(np.float32)
         episode = {
@@ -46,7 +43,7 @@ def load_episode(path: pathlib.Path, camera_keys: list[str], decode_color_order:
         for camera_key in camera_keys:
             images = root[f"observation/{camera_key}/rgb"]
             episode[camera_key] = np.stack(
-                [decode_image(x, color_order=decode_color_order) for x in images[:-1]],
+                [decode_image(x) for x in images[:-1]],
                 axis=0,
             )
     return episode
@@ -57,12 +54,6 @@ def main():
     parser.add_argument("--input", default="/home/wentao/RoboTwin/data/lift_pot")
     parser.add_argument("--output", default="data/datasets/lift_pot")
     parser.add_argument("--camera", nargs="+", default=["head_camera"])
-    parser.add_argument(
-        "--decode-color-order",
-        choices=["rgb", "bgr"],
-        default="rgb",
-        help="Interpret decoded camera images as RGB or swap red/blue to correct BGR sources.",
-    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -86,7 +77,7 @@ def main():
 
     total_steps = 0
     for episode_path in episode_paths:
-        episode = load_episode(episode_path, args.camera, args.decode_color_order)
+        episode = load_episode(episode_path, args.camera)
         replay_buffer.add_episode(episode, compressors="disk")
         total_steps += len(episode["action"])
         print(f"{episode_path.name}: {len(episode['action'])} steps")
