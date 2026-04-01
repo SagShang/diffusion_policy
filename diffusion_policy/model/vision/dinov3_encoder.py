@@ -134,7 +134,14 @@ class SpatialSoftmax2d(nn.Module):
 
 class DINOv3CameraAdapter(nn.Module):
 
-    def __init__(self, input_dim: int, adapter_dim: int, output_dim: int, pooling: str = "spatial_softmax"):
+    def __init__(
+        self,
+        input_dim: int,
+        adapter_dim: int,
+        output_dim: int,
+        pooling: str = "spatial_softmax",
+        use_residual_gating: bool = True,
+    ):
         super().__init__()
         num_groups = _get_num_groups(adapter_dim)
         self.skip = (
@@ -152,8 +159,12 @@ class DINOv3CameraAdapter(nn.Module):
         )
         self.act = nn.GELU()
         self.out_proj = nn.Conv2d(adapter_dim, adapter_dim, kernel_size=1, bias=False)
-        # Start from exact identity while keeping the residual branch trainable.
-        self.gate = nn.Parameter(torch.zeros(1))
+        self.use_residual_gating = bool(use_residual_gating)
+        if self.use_residual_gating:
+            # Start from exact identity while keeping the residual branch trainable.
+            self.gate = nn.Parameter(torch.zeros(1))
+        else:
+            self.register_parameter("gate", None)
 
         if pooling == "attention":
             self.pool = AttentionPool2d(adapter_dim)
@@ -179,7 +190,10 @@ class DINOv3CameraAdapter(nn.Module):
         reduced = self.dwconv(reduced)
         reduced = self.act(reduced)
         reduced = self.out_proj(reduced)
-        reduced = residual + self.gate * reduced
+        if self.use_residual_gating:
+            reduced = residual + self.gate * reduced
+        else:
+            reduced = residual + reduced
         if self.pooling == "attention":
             pooled = self.pool(reduced.flatten(2).transpose(1, 2))
         elif self.pooling == "avg":
@@ -201,6 +215,7 @@ class DINOv3Encoder(nn.Module):
         fuse_layers=1,
         fuse_cls=False,
         pooling="spatial_softmax",
+        use_residual_gating=True,
         lora_rank=0,
         lora_alpha=16.0,
         lora_dropout=0.0,
@@ -263,6 +278,7 @@ class DINOv3Encoder(nn.Module):
             adapter_dim=adapter_dim,
             output_dim=output_dim,
             pooling=pooling,
+            use_residual_gating=use_residual_gating,
         )
 
     def train(self, mode: bool = True):

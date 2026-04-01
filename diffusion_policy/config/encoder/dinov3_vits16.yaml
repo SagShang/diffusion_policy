@@ -6,9 +6,10 @@ rgb_model:
   output_dim: 512
   adapter_dim: 256
   resize_long_edge: 320
-  fuse_layers: 1
-  fuse_cls: true
+  fuse_layers: 4
+  fuse_cls: false
   pooling: spatial_softmax
+  use_residual_gating: false
   lora_rank: 0
   lora_alpha: 16
   lora_dropout: 0.05
