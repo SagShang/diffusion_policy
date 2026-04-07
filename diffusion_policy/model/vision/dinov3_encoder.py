@@ -175,6 +175,12 @@ class DINOv3CameraAdapter(nn.Module):
         elif pooling == "spatial_softmax":
             self.pool = SpatialSoftmax2d()
             pooled_dim = adapter_dim * 2
+        elif pooling == "spatial_avg":
+            self.pool = nn.ModuleDict({
+                "spatial": SpatialSoftmax2d(),
+                "avg": nn.AdaptiveAvgPool2d((1, 1)),
+            })
+            pooled_dim = adapter_dim * 3
         else:
             raise ValueError(f"Unsupported pooling mode: {pooling}")
 
@@ -198,6 +204,11 @@ class DINOv3CameraAdapter(nn.Module):
             pooled = self.pool(reduced.flatten(2).transpose(1, 2))
         elif self.pooling == "avg":
             pooled = self.pool(reduced).flatten(start_dim=1)
+        elif self.pooling == "spatial_avg":
+            pooled = torch.cat([
+                self.pool["spatial"](reduced),
+                self.pool["avg"](reduced).flatten(start_dim=1),
+            ], dim=-1)
         else:
             pooled = self.pool(reduced)
         return self.out(pooled)

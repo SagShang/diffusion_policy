@@ -8,7 +8,7 @@ rgb_model:
   resize_long_edge: 320
   fuse_layers: 4
   fuse_cls: false
-  pooling: spatial_softmax
+  pooling: spatial_avg
   use_residual_gating: false
   lora_rank: 0
   lora_alpha: 16
