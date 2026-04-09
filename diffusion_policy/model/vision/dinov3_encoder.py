@@ -1,5 +1,6 @@
 import importlib
 import importlib.util
+import re
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -14,9 +15,24 @@ def _get_repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _build_dinov3_backbone(weights, pretrained: bool = True) -> nn.Module:
+def _infer_dinov3_builder_name(weights) -> str | None:
     if weights is None:
-        raise ValueError("DINOv3 weights path is required")
+        return None
+
+    weights_name = Path(str(weights)).name
+    match = re.search(r"(dinov3_[a-z0-9]+)_pretrain_", weights_name)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _build_dinov3_backbone(
+    weights,
+    pretrained: bool = True,
+    backbone_name: str | None = None,
+) -> nn.Module:
+    if pretrained and weights is None:
+        raise ValueError("DINOv3 weights path is required when pretrained=True")
 
     repo_path = _get_repo_root() / "third_party" / "dinov3"
     repo_path_str = str(repo_path)
@@ -24,7 +40,10 @@ def _build_dinov3_backbone(weights, pretrained: bool = True) -> nn.Module:
         sys.path.insert(0, repo_path_str)
     dinov3_backbones = importlib.import_module("dinov3.hub.backbones")
 
-    builder = dinov3_backbones.dinov3_vits16
+    builder_name = backbone_name or _infer_dinov3_builder_name(weights) or "dinov3_vits16"
+    if not hasattr(dinov3_backbones, builder_name):
+        raise ValueError(f"Unsupported DINOv3 backbone: {builder_name}")
+    builder = getattr(dinov3_backbones, builder_name)
     backbone = builder(pretrained=False)
     if not pretrained:
         return backbone
@@ -204,6 +223,7 @@ class DINOv3Encoder(nn.Module):
     def __init__(
         self,
         weights=None,
+        backbone_name: str | None = None,
         pretrained=True,
         freeze_backbone=True,
         output_dim=512,
@@ -224,6 +244,7 @@ class DINOv3Encoder(nn.Module):
         self.backbone = _build_dinov3_backbone(
             weights=weights,
             pretrained=pretrained,
+            backbone_name=backbone_name,
         )
 
         self.backbone.requires_grad_(not freeze_backbone)
