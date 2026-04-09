@@ -1,6 +1,6 @@
 rgb_model:
   _target_: diffusion_policy.model.vision.model_getter.get_dinov3
-  weights: data/pretrained/dinov3/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+  weights: data/pretrained/dinov3/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
   pretrained: true
   freeze_backbone: true
   output_dim: 512
@@ -9,10 +9,10 @@ rgb_model:
   fuse_layers: 4
   pooling: spatial_softmax
   trainable_norm: true
-  lora_rank: 0
-  lora_alpha: 16
+  lora_rank: 8
+  lora_alpha: 8
   lora_dropout: 0.05
-  lora_blocks: 0
+  lora_blocks: 4
   lora_targets: [attn.qkv, attn.proj]
   lora_lr_scale: 1.0
 

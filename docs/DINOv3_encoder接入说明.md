@@ -7,7 +7,6 @@
   - 内置长边缩放、patch 对齐 padding、ImageNet 归一化
   - 使用最后 `4` 层 patch feature 做 softmax 融合
   - 通过轻量 adapter + `spatial_softmax` 输出 `512` 维特征
-  - adapter 支持通过 `use_residual_gating` 控制是否启用残差门控
 - 新增 encoder 配置组：
   - `diffusion_policy/config/encoder/resnet18.yaml`
   - `diffusion_policy/config/encoder/dinov3_vits16.yaml`

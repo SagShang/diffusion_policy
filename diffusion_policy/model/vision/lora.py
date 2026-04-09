@@ -13,6 +13,30 @@ def normalize_module_paths(module_paths: Sequence[str] | str | None) -> tuple[st
     return tuple(str(path) for path in module_paths)
 
 
+def _is_norm_module(module: nn.Module) -> bool:
+    if isinstance(
+        module,
+        (
+            nn.LayerNorm,
+            nn.GroupNorm,
+            nn.BatchNorm1d,
+            nn.BatchNorm2d,
+            nn.BatchNorm3d,
+            nn.InstanceNorm1d,
+            nn.InstanceNorm2d,
+            nn.InstanceNorm3d,
+        ),
+    ):
+        return True
+    return module.__class__.__name__ == "RMSNorm"
+
+
+def _unfreeze_norm_modules(module: nn.Module) -> None:
+    for submodule in module.modules():
+        if _is_norm_module(submodule):
+            submodule.requires_grad_(True)
+
+
 class LoRALinear(nn.Module):
     def __init__(self, base_layer: nn.Linear, rank: int, alpha: float = 1.0, dropout: float = 0.0):
         super().__init__()
@@ -115,5 +139,6 @@ def inject_lora(
                     dropout=lora_dropout,
                 ),
             )
+        _unfreeze_norm_modules(block)
 
     return backbone

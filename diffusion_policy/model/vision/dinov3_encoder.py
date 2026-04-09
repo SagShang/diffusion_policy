@@ -140,31 +140,25 @@ class DINOv3CameraAdapter(nn.Module):
         adapter_dim: int,
         output_dim: int,
         pooling: str = "spatial_softmax",
-        use_residual_gating: bool = True,
     ):
         super().__init__()
         num_groups = _get_num_groups(adapter_dim)
-        self.skip = (
-            nn.Conv2d(input_dim, adapter_dim, kernel_size=1, bias=False)
-            if input_dim != adapter_dim else nn.Identity()
+        self.proj = nn.Sequential(
+            nn.Conv2d(input_dim, adapter_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim),
+            nn.GELU(),
+            nn.Conv2d(
+                adapter_dim,
+                adapter_dim,
+                kernel_size=3,
+                padding=1,
+                groups=adapter_dim,
+                bias=False,
+            ),
+            nn.Conv2d(adapter_dim, adapter_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim),
+            nn.GELU(),
         )
-        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=adapter_dim)
-        self.dwconv = nn.Conv2d(
-            adapter_dim,
-            adapter_dim,
-            kernel_size=3,
-            padding=1,
-            groups=adapter_dim,
-            bias=False,
-        )
-        self.act = nn.GELU()
-        self.out_proj = nn.Conv2d(adapter_dim, adapter_dim, kernel_size=1, bias=False)
-        self.use_residual_gating = bool(use_residual_gating)
-        if self.use_residual_gating:
-            # Start from exact identity while keeping the residual branch trainable.
-            self.gate = nn.Parameter(torch.zeros(1))
-        else:
-            self.register_parameter("gate", None)
 
         if pooling == "attention":
             self.pool = AttentionPool2d(adapter_dim)
@@ -191,15 +185,7 @@ class DINOv3CameraAdapter(nn.Module):
         self.pooling = pooling
 
     def forward(self, feature_map: torch.Tensor) -> torch.Tensor:
-        residual = self.skip(feature_map)
-        reduced = self.norm(residual)
-        reduced = self.dwconv(reduced)
-        reduced = self.act(reduced)
-        reduced = self.out_proj(reduced)
-        if self.use_residual_gating:
-            reduced = residual + self.gate * reduced
-        else:
-            reduced = residual + reduced
+        reduced = self.proj(feature_map)
         if self.pooling == "attention":
             pooled = self.pool(reduced.flatten(2).transpose(1, 2))
         elif self.pooling == "avg":
@@ -224,9 +210,8 @@ class DINOv3Encoder(nn.Module):
         adapter_dim=256,
         resize_long_edge=320,
         fuse_layers=1,
-        fuse_cls=False,
         pooling="spatial_softmax",
-        use_residual_gating=True,
+        trainable_norm=False,
         lora_rank=0,
         lora_alpha=16.0,
         lora_dropout=0.0,
@@ -251,7 +236,6 @@ class DINOv3Encoder(nn.Module):
         embed_dim = int(getattr(self.backbone, "embed_dim"))
         total_blocks = len(self.backbone.blocks)
         num_fused_layers = max(1, min(fuse_layers, total_blocks))
-        self.fuse_cls = bool(fuse_cls)
 
         self.preprocess = DINOv3ImagePreprocessor(
             resize_long_edge=resize_long_edge,
@@ -266,31 +250,28 @@ class DINOv3Encoder(nn.Module):
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
         )
+        self.trainable_norm = bool(trainable_norm)
+        if self.trainable_norm:
+            self._unfreeze_norms()
         self.backbone_requires_grad = any(param.requires_grad for param in self.backbone.parameters())
 
         if num_fused_layers > 1:
             self.layer_weights = nn.Parameter(torch.zeros(num_fused_layers))
-            if self.fuse_cls:
-                self.cls_layer_weights = nn.Parameter(torch.zeros(num_fused_layers))
-            else:
-                self.register_parameter("cls_layer_weights", None)
         else:
             self.register_parameter("layer_weights", None)
-            self.register_parameter("cls_layer_weights", None)
-
-        if self.fuse_cls:
-            # Start from patch-only features; let training decide how much global cls context to add.
-            self.cls_weight = nn.Parameter(torch.zeros(1))
-        else:
-            self.register_parameter("cls_weight", None)
 
         self.adapter = DINOv3CameraAdapter(
             input_dim=embed_dim,
             adapter_dim=adapter_dim,
             output_dim=output_dim,
             pooling=pooling,
-            use_residual_gating=use_residual_gating,
         )
+
+    def _unfreeze_norms(self) -> None:
+        for norm_name in ("norm", "cls_norm", "local_cls_norm"):
+            norm = getattr(self.backbone, norm_name, None)
+            if norm is not None:
+                norm.requires_grad_(True)
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -331,14 +312,6 @@ class DINOv3Encoder(nn.Module):
         stacked = torch.stack(feature_maps, dim=1)
         return torch.sum(stacked * weights.view(1, -1, 1, 1, 1), dim=1)
 
-    def _fuse_class_tokens(self, class_tokens):
-        if len(class_tokens) == 1:
-            return class_tokens[0]
-
-        weights = torch.softmax(self.cls_layer_weights, dim=0)
-        stacked = torch.stack(class_tokens, dim=1)
-        return torch.sum(stacked * weights.view(1, -1, 1), dim=1)
-
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         images = self.preprocess(images)
 
@@ -347,7 +320,7 @@ class DINOv3Encoder(nn.Module):
                 images,
                 n=self.layer_indices,
                 reshape=True,
-                return_class_token=self.fuse_cls,
+                return_class_token=False,
                 norm=True,
             )
         else:
@@ -356,20 +329,8 @@ class DINOv3Encoder(nn.Module):
                     images,
                     n=self.layer_indices,
                     reshape=True,
-                    return_class_token=self.fuse_cls,
+                    return_class_token=False,
                     norm=True,
                 )
 
-        if self.fuse_cls:
-            feature_maps = [feature_map for feature_map, _ in backbone_outputs]
-            class_tokens = [class_token for _, class_token in backbone_outputs]
-        else:
-            feature_maps = backbone_outputs
-
-        feature_map = self._fuse_feature_maps(feature_maps)
-        if self.fuse_cls:
-            class_token = self._fuse_class_tokens(class_tokens)
-            feature_map = feature_map + self.cls_weight.to(dtype=feature_map.dtype) * class_token[
-                :, :, None, None
-            ].to(dtype=feature_map.dtype)
-        return self.adapter(feature_map)
+        return self.adapter(self._fuse_feature_maps(backbone_outputs))
