@@ -16,7 +16,6 @@ from diffusion_policy.common.normalize_util import (
     get_identity_image_normalizer,
     get_image_range_normalizer,
 )
-import pdb
 
 
 class RobotImageDataset(BaseImageDataset):
@@ -32,12 +31,33 @@ class RobotImageDataset(BaseImageDataset):
         batch_size=128,
         max_train_episodes=None,
         image_normalizer="range",
+        shape_meta=None,
     ):
 
         super().__init__()
+        assert shape_meta is not None
+        obs_shape_meta = shape_meta["obs"]
+        self.rgb_obs_keys = [
+            key for key, attr in obs_shape_meta.items()
+            if attr.get("type", "low_dim") == "rgb"
+        ]
+        self.low_dim_obs_keys = [
+            key for key, attr in obs_shape_meta.items()
+            if attr.get("type", "low_dim") == "low_dim"
+        ]
+        self.obs_key_to_buffer_key = {
+            key: self._resolve_buffer_key(key)
+            for key in self.rgb_obs_keys + self.low_dim_obs_keys
+        }
+        replay_buffer_keys = list(
+            dict.fromkeys([
+                *self.obs_key_to_buffer_key.values(),
+                "action",
+            ])
+        )
         self.replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path,
-            keys=["head_camera", "left_camera", "right_camera", "state", "action"],
+            keys=replay_buffer_keys,
         )
 
         val_mask = get_val_mask(n_episodes=self.replay_buffer.n_episodes, val_ratio=val_ratio, seed=seed)
@@ -67,6 +87,14 @@ class RobotImageDataset(BaseImageDataset):
         for v in self.buffers_torch.values():
             v.pin_memory()
 
+    @staticmethod
+    def _resolve_buffer_key(obs_key):
+        if obs_key.endswith("_cam"):
+            return obs_key[:-4] + "_camera"
+        if obs_key == "agent_pos":
+            return "state"
+        return obs_key
+
     def get_validation_dataset(self):
         val_set = copy.copy(self)
         val_set.sampler = SequenceSampler(
@@ -80,10 +108,9 @@ class RobotImageDataset(BaseImageDataset):
         return val_set
 
     def get_normalizer(self, mode="limits", **kwargs):
-        data = {
-            "action": self.replay_buffer["action"],
-            "agent_pos": self.replay_buffer["state"],
-        }
+        data = {"action": self.replay_buffer["action"]}
+        for obs_key in self.low_dim_obs_keys:
+            data[obs_key] = self.replay_buffer[self.obs_key_to_buffer_key[obs_key]]
         normalizer = LinearNormalizer()
         normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
         if self.image_normalizer == "range":
@@ -92,10 +119,8 @@ class RobotImageDataset(BaseImageDataset):
             image_normalizer = get_identity_image_normalizer()
         else:
             raise ValueError(f"Unsupported image_normalizer: {self.image_normalizer}")
-        normalizer["head_cam"] = image_normalizer
-        normalizer["front_cam"] = image_normalizer
-        normalizer["left_cam"] = image_normalizer
-        normalizer["right_cam"] = image_normalizer
+        for obs_key in self.rgb_obs_keys:
+            normalizer[obs_key] = image_normalizer
         return normalizer
 
     def __len__(self) -> int:
@@ -140,18 +165,15 @@ class RobotImageDataset(BaseImageDataset):
             raise ValueError(idx)
 
     def postprocess(self, samples, device):
-        agent_pos = samples["state"].to(device, non_blocking=True)
-        head_cam = samples["head_camera"].to(device, non_blocking=True) / 255.0
-        left_cam = samples["left_camera"].to(device, non_blocking=True) / 255.0
-        right_cam = samples["right_camera"].to(device, non_blocking=True) / 255.0
+        obs = dict()
+        for obs_key in self.rgb_obs_keys:
+            image = samples[self.obs_key_to_buffer_key[obs_key]].to(device, non_blocking=True)
+            obs[obs_key] = image.float() / 255.0
+        for obs_key in self.low_dim_obs_keys:
+            obs[obs_key] = samples[self.obs_key_to_buffer_key[obs_key]].to(device, non_blocking=True)
         action = samples["action"].to(device, non_blocking=True)
         return {
-            "obs": {
-                "head_cam": head_cam,  # B, T, 3, H, W
-                "left_cam": left_cam,  # B, T, 3, H, W
-                "right_cam": right_cam,  # B, T, 3, H, W
-                "agent_pos": agent_pos,  # B, T, D
-            },
+            "obs": obs,
             "action": action,  # B, T, D
         }
 

@@ -106,7 +106,7 @@ class RobotWorkspace(BaseWorkspace):
 
         # configure dataset
         dataset: BaseImageDataset
-        dataset = hydra.utils.instantiate(cfg.task.dataset)
+        dataset = hydra.utils.instantiate(cfg.task.dataset, shape_meta=cfg.shape_meta)
         assert isinstance(dataset, BaseImageDataset)
         train_dataloader = create_dataloader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
